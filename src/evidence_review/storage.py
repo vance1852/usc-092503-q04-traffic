@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -157,12 +157,116 @@ CREATE TABLE IF NOT EXISTS audit_events (
     payload_json TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+-- 物证保管链：材料主档，逻辑身份与批次/证据记录关联。
+CREATE TABLE IF NOT EXISTS custody_materials (
+    material_id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    material_type TEXT NOT NULL,
+    batch_id TEXT REFERENCES batches(batch_id),
+    evidence_item_id INTEGER REFERENCES evidence_items(evidence_item_id),
+    state TEXT NOT NULL CHECK (state IN (
+        'sealed', 'in_transfer', 'rejected', 'stored', 'lost', 'resealed',
+        'access_pending', 'accessed', 'locked'
+    )),
+    current_version_seq INTEGER REFERENCES custody_material_versions(version_seq),
+    holder_user_id TEXT REFERENCES users(user_id),
+    location_id TEXT REFERENCES custody_locations(location_id),
+    locked_for_decision INTEGER NOT NULL DEFAULT 0 CHECK (locked_for_decision IN (0, 1)),
+    registered_by TEXT NOT NULL REFERENCES users(user_id),
+    registered_at TEXT NOT NULL,
+    last_event_hash TEXT,
+    chain_length INTEGER NOT NULL DEFAULT 0 CHECK (chain_length >= 0),
+    CHECK (holder_user_id IS NOT NULL OR state IN ('lost', 'accessed'))
+);
+
+-- 物证保管链：只追加的内容版本。后续上传只产生新版本，永不覆盖。
+CREATE TABLE IF NOT EXISTS custody_material_versions (
+    version_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id TEXT NOT NULL REFERENCES custody_materials(material_id),
+    version_no INTEGER NOT NULL CHECK (version_no > 0),
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    package_sha256 TEXT NOT NULL CHECK (length(package_sha256) = 64),
+    size_bytes INTEGER NOT NULL CHECK (size_bytes >= 0),
+    media_type TEXT NOT NULL,
+    change_note TEXT NOT NULL,
+    supersedes_version_no INTEGER,
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    UNIQUE (material_id, version_no),
+    UNIQUE (material_id, package_sha256)
+);
+
+-- 物证保管链：保管位置主数据。
+CREATE TABLE IF NOT EXISTS custody_locations (
+    location_id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('vault', 'room', 'vehicle', 'court', 'external')),
+    created_at TEXT NOT NULL
+);
+
+-- 物证保管链：逐次交接，交出与接收双方分别确认。
+CREATE TABLE IF NOT EXISTS custody_transfers (
+    transfer_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id TEXT NOT NULL REFERENCES custody_materials(material_id),
+    sequence_no INTEGER NOT NULL,
+    from_user_id TEXT REFERENCES users(user_id),
+    to_user_id TEXT NOT NULL REFERENCES users(user_id),
+    from_location_id TEXT REFERENCES custody_locations(location_id),
+    to_location_id TEXT REFERENCES custody_locations(location_id),
+    state TEXT NOT NULL CHECK (state IN ('proposed', 'accepted', 'rejected', 'cancelled')),
+    purpose TEXT NOT NULL,
+    proposed_at TEXT NOT NULL,
+    proposed_by TEXT NOT NULL REFERENCES users(user_id),
+    responded_at TEXT,
+    reject_reason TEXT,
+    UNIQUE (material_id, sequence_no)
+);
+
+-- 物证保管链：依法调阅申请与批准。
+CREATE TABLE IF NOT EXISTS custody_access_requests (
+    request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id TEXT NOT NULL REFERENCES custody_materials(material_id),
+    requester_user_id TEXT NOT NULL REFERENCES users(user_id),
+    requester_name TEXT NOT NULL,
+    requester_contact TEXT NOT NULL,
+    legal_basis TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('pending', 'approved', 'rejected', 'returned', 'expired')),
+    decided_by TEXT REFERENCES users(user_id),
+    decided_at TEXT,
+    decision_note TEXT,
+    approved_until TEXT,
+    returned_at TEXT,
+    return_note TEXT,
+    created_at TEXT NOT NULL
+);
+
+-- 物证保管链：只追加的哈希链事件，任何状态变化都在此留下一环。
+CREATE TABLE IF NOT EXISTS custody_events (
+    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id TEXT NOT NULL REFERENCES custody_materials(material_id),
+    sequence_no INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    actor_id TEXT NOT NULL REFERENCES users(user_id),
+    state_after TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    content_sha256 TEXT CHECK (content_sha256 IS NULL OR length(content_sha256) = 64),
+    package_sha256 TEXT CHECK (package_sha256 IS NULL OR length(package_sha256) = 64),
+    prev_hash TEXT,
+    event_hash TEXT NOT NULL CHECK (length(event_hash) = 64),
+    created_at TEXT NOT NULL,
+    UNIQUE (material_id, sequence_no),
+    UNIQUE (event_hash)
+);
 """
 
 REQUIRED_TABLES = frozenset({
     "schema_meta", "evidence_protocol_catalog", "users", "capture_devices", "builds", "batches",
     "evidence_items", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
+    "custody_materials", "custody_material_versions", "custody_locations",
+    "custody_transfers", "custody_access_requests", "custody_events",
 })
 
 

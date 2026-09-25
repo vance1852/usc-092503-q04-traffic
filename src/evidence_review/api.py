@@ -9,8 +9,9 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
+from .custody import CustodyService
 from .errors import ServiceError, ValidationFailed
 from .service import EvidenceReviewService
 from .storage import connect
@@ -25,8 +26,9 @@ class Response:
 class JsonApplication:
     """将 HTTP 路由映射到领域服务，便于无网络单元测试。"""
 
-    def __init__(self, service: EvidenceReviewService) -> None:
+    def __init__(self, service: EvidenceReviewService, custody: CustodyService | None = None) -> None:
         self.service = service
+        self.custody = custody or CustodyService(service.connection)
 
     @staticmethod
     def _actor(headers: Mapping[str, str]) -> str:
@@ -133,11 +135,100 @@ class JsonApplication:
                     payload["decision"], payload["reason"],
                 )
                 return Response(201, result)
+            result = self._handle_custody(method, target, normalized_headers, payload)
+            if result is not None:
+                return result
             return Response(404, {"error": {"code": "route_not_found", "message": "接口不存在"}})
         except ServiceError as exc:
             return Response(exc.status, {"error": {"code": exc.code, "message": str(exc)}})
         except (KeyError, TypeError, ValueError) as exc:
             return Response(422, {"error": {"code": "invalid_request", "message": str(exc)}})
+
+
+    def _handle_custody(
+        self, method: str, target: str, headers: Mapping[str, str], payload: dict[str, Any]
+    ) -> Response | None:
+        query = urlparse(target).query
+        path = urlparse(target).path.rstrip("/") or "/"
+        parts = [part for part in path.split("/") if part]
+        c = self.custody
+
+        def require_actor() -> str:
+            return self._actor(headers)
+
+        if method == "POST" and path == "/custody/locations":
+            return Response(201, c.register_location(
+                require_actor(), payload["location_id"], payload["label"], payload["kind"]))
+        if method == "POST" and path == "/custody/materials":
+            return Response(201, c.register_material(
+                require_actor(), payload["material_id"], payload["title"], payload["material_type"],
+                payload["location_id"], payload["content_sha256"], payload["package_sha256"],
+                int(payload["size_bytes"]), payload["media_type"], payload.get("note", ""),
+                payload.get("batch_id"),
+                None if payload.get("evidence_item_id") is None else int(payload["evidence_item_id"]),
+            ))
+        if len(parts) == 4 and parts[:2] == ["custody", "materials"] and parts[3] in {"versions", "transfers", "chain"}:
+            material_id = parts[2]
+            sub_resource = parts[3]
+            if method == "POST" and sub_resource == "versions":
+                return Response(201, c.upload_version(
+                    require_actor(), material_id, payload["content_sha256"], payload["package_sha256"],
+                    int(payload["size_bytes"]), payload["change_note"]))
+            if method == "POST" and sub_resource == "transfers":
+                return Response(201, c.propose_transfer(
+                    require_actor(), material_id, payload["to_user_id"], payload["to_location_id"],
+                    payload["purpose"]))
+            if method == "GET" and sub_resource == "chain":
+                return Response(200, c.chain_view(require_actor(), material_id))
+        if len(parts) == 4 and parts[:2] == ["custody", "materials"]:
+            material_id, action = parts[2], parts[3]
+            if method == "GET" and action == "verification":
+                return Response(200, c.verification(require_actor(), material_id))
+            if method == "POST" and action == "loss":
+                return Response(200, c.report_loss(require_actor(), material_id, payload["reason"]))
+            if method == "POST" and action == "found":
+                return Response(200, c.report_found(
+                    require_actor(), material_id, payload["location_id"], payload["note"]))
+            if method == "POST" and action == "reseal":
+                return Response(200, c.reseal(
+                    require_actor(), material_id, payload["new_package_sha256"],
+                    payload["witness_user_id"], payload["note"]))
+            if method == "POST" and action == "access_requests":
+                return Response(201, c.request_access(
+                    require_actor(), material_id, payload["requester_name"],
+                    payload["requester_contact"], payload["legal_basis"], payload["purpose"]))
+            if method == "POST" and action == "lock":
+                version_no = payload.get("version_no")
+                return Response(200, c.lock_for_decision(
+                    require_actor(), material_id, payload["decision_reference"],
+                    None if version_no is None else int(version_no)))
+        if len(parts) == 4 and parts[:2] == ["custody", "transfers"]:
+            transfer_id, action = int(parts[2]), parts[3]
+            if method == "POST" and action == "respond":
+                return Response(200, c.respond_transfer(
+                    require_actor(), transfer_id, bool(payload["accept"]), payload.get("note", "")))
+            if method == "POST" and action == "cancel":
+                return Response(200, c.cancel_transfer(
+                    require_actor(), transfer_id, payload["reason"]))
+        if len(parts) == 4 and parts[:2] == ["custody", "access_requests"]:
+            request_id, action = int(parts[2]), parts[3]
+            if method == "POST" and action == "decide":
+                return Response(200, c.decide_access(
+                    require_actor(), request_id, bool(payload["approve"]), payload["note"],
+                    payload.get("approved_until")))
+            if method == "POST" and action == "checkout":
+                return Response(200, c.checkout_access(
+                    require_actor(), request_id, payload["handover_note"]))
+            if method == "POST" and action == "return":
+                return Response(200, c.return_access(
+                    require_actor(), request_id, payload["location_id"], payload["note"]))
+            if method == "POST" and action == "expire":
+                return Response(200, c.expire_access(
+                    require_actor(), request_id, payload["note"]))
+        if method == "GET" and path == "/custody/materials":
+            batch_id = parse_qs(query).get("batch_id", [None])[0] if query else None
+            return Response(200, c.list_materials(require_actor(), batch_id))
+        return None
 
 
 def make_handler(application: JsonApplication):

@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
 from .contracts import EvidenceItem, EvidenceProtocol, ValidationError
+from .custody import CustodyService, verify_chain
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
@@ -495,24 +496,54 @@ class EvidenceReviewService:
         batch = self.get_batch(batch_id)
         if batch["state"] != "analyzed" or batch["revision"] != analysis_row["batch_revision"]:
             raise InvalidState("分析不是批次当前可审批版本")
+        # 责任认定只能建立在保全链完整的原始材料上。
+        is_final_decision = decision in {"approved", "rejected"}
+        decision_reference = f"decision:{batch_id}"
         try:
             with transaction(self.connection, immediate=True):
+                if is_final_decision:
+                    custody_rows = self.connection.execute(
+                        "SELECT material_id FROM custody_materials WHERE locked_for_decision=0 AND ("
+                        "batch_id=? OR evidence_item_id IN ("
+                        "SELECT evidence_item_id FROM evidence_items WHERE batch_id=?))",
+                        (batch_id, batch_id),
+                    ).fetchall()
+                    for custody_row in custody_rows:
+                        verification = verify_chain(self.connection, custody_row["material_id"])
+                        if not verification["intact"]:
+                            raise InvalidState(
+                                f"物证 {custody_row['material_id']} 保全链校验未通过，不能用于责任认定"
+                            )
                 cursor = self.connection.execute(
                     "INSERT INTO decisions(batch_id,analysis_id,decision,reason,decided_by,decided_at) "
                     "VALUES(?,?,?,?,?,?)",
                     (batch_id, analysis_id, decision, reason, actor_id, self._now()),
                 )
                 self.connection.execute("UPDATE batches SET state='decided' WHERE batch_id=?", (batch_id,))
+                locked_materials: list[dict[str, Any]] = []
+                locked_count = 0
+                if is_final_decision:
+                    custody = CustodyService(self.connection, self.clock)
+                    locked_materials = custody.lock_batch_within_transaction(
+                        actor_id, batch_id, decision_reference
+                    )
+                    locked_count = len(custody_rows)
                 self._audit(
                     "batch",
                     batch_id,
                     "decision.recorded",
                     actor_id,
-                    {"decision_id": cursor.lastrowid, "analysis_id": analysis_id, "decision": decision},
+                    {
+                        "decision_id": cursor.lastrowid,
+                        "analysis_id": analysis_id,
+                        "decision": decision,
+                        "locked_materials": locked_materials,
+                    },
                 )
         except sqlite3.IntegrityError as exc:
             raise Conflict("该分析版本已经形成决定") from exc
-        return {"batch_id": batch_id, "analysis_id": analysis_id, "decision": decision}
+        return {"batch_id": batch_id, "analysis_id": analysis_id, "decision": decision,
+                "locked_materials": locked_count}
 
     def report(self, actor_id: str, batch_id: str) -> dict[str, Any]:
         user = self._user(actor_id)
@@ -538,6 +569,26 @@ class EvidenceReviewService:
             "WHERE entity_type='batch' AND entity_id=? "
             "ORDER BY event_id", (batch_id,)
         ).fetchall()
+        custody_materials: list[dict[str, Any]] = []
+        custody_rows = self.connection.execute(
+            "SELECT material_id,state,current_version_seq,holder_user_id,location_id,"
+            "locked_for_decision,chain_length FROM custody_materials WHERE batch_id=? "
+            "OR evidence_item_id IN (SELECT evidence_item_id FROM evidence_items WHERE batch_id=?) "
+            "ORDER BY material_id",
+            (batch_id, batch_id),
+        ).fetchall()
+        for custody_row in custody_rows:
+            verification = verify_chain(self.connection, custody_row["material_id"])
+            custody_materials.append({
+                "material_id": custody_row["material_id"],
+                "state": custody_row["state"],
+                "holder_user_id": custody_row["holder_user_id"],
+                "location_id": custody_row["location_id"],
+                "chain_length": custody_row["chain_length"],
+                "locked_for_decision": bool(custody_row["locked_for_decision"]),
+                "chain_intact": verification["intact"],
+                "anomalies": verification["anomalies"],
+            })
         return {
             "batch": batch,
             "evidence_protocol": {
@@ -556,5 +607,6 @@ class EvidenceReviewService:
             },
             "decision": None if decision_row is None else dict(decision_row),
             "exclusions": [dict(row) for row in exclusions],
+            "custody_materials": custody_materials,
             "events": [dict(row) | {"payload": json.loads(row["payload_json"])} for row in events],
         }
